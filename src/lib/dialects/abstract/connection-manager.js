@@ -2,10 +2,8 @@
 
 const { Pool, TimeoutError } = require('sequelize-pool');
 const _ = require('lodash');
-const semver = require('semver');
 const errors = require('../../errors');
 const { logger } = require('../../utils/logger');
-const deprecations = require('../../utils/deprecations');
 const debug = logger.debugContext('pool');
 
 /**
@@ -176,10 +174,7 @@ class ConnectionManager {
         }
         return this.pool.write.acquire();
       },
-      destroy: connection => {
-        this.pool[connection.queryType].destroy(connection);
-        debug('connection destroy');
-      },
+      destroy: connection => this.pool[connection.queryType].destroy(connection),
       destroyAllNow: async () => {
         await Promise.all([
           this.pool.read.destroyAllNow(),
@@ -247,32 +242,23 @@ class ConnectionManager {
     if (this.sequelize.options.databaseVersion === 0) {
       if (!this.versionPromise) {
         this.versionPromise = (async () => {
+          let connection;
           try {
-            const connection = await this._connect(this.config.replication.write || this.config);
-            const _options = {};
-
-            _options.transaction = { connection }; // Cheat .query to use our private connection
-            _options.logging = () => {};
-            _options.logging.__testLoggingFn = true;
-
-            //connection might have set databaseVersion value at initialization,
-            //avoiding a useless round trip
+            connection = await this._connect(this.config.replication.write || this.config);
+            const options = {
+              transaction: { connection },
+              logging: false
+            };
             if (this.sequelize.options.databaseVersion === 0) {
-              const version = await this.sequelize.databaseVersion(_options);
-              // const parsedVersion = _.get(semver.coerce(version), 'version') || version;
-              this.sequelize.options.databaseVersion =version ||  this.dialect.defaultVersion;
+              const version = await this.sequelize.databaseVersion(options);
+              this.sequelize.options.databaseVersion = version || this.dialect.defaultVersion;
             }
-
-            // if (semver.lt(this.sequelize.options.databaseVersion, this.dialect.defaultVersion)) {
-            //   deprecations.unsupportedEngine();
-            //   debug(`Unsupported database engine version ${this.sequelize.options.databaseVersion}`);
-            // }
-
-            this.versionPromise = null;
-            return await this._disconnect(connection);
-          } catch (err) {
-            this.versionPromise = null;
-            throw err;
+          } finally {
+            try {
+              if (connection) await this._disconnect(connection);
+            } finally {
+              this.versionPromise = null;
+            }
           }
         })();
       }
@@ -305,6 +291,11 @@ class ConnectionManager {
     debug('connection released');
   }
 
+  async destroyConnection(connection) {
+    await this.pool.destroy(connection);
+    debug('connection destroyed');
+  }
+
   /**
    * Call dialect library to get connection
    *
@@ -315,8 +306,18 @@ class ConnectionManager {
   async _connect(config) {
     await this.sequelize.runHooks('beforeConnect', config);
     const connection = await this.dialect.connectionManager.connect(config);
-    await this.sequelize.runHooks('afterConnect', connection, config);
-    return connection;
+    try {
+      await this.sequelize.runHooks('afterConnect', connection, config);
+      return connection;
+    } catch (error) {
+      // The connection has not entered the pool yet, so we must close it here.
+      try {
+        await this.dialect.connectionManager.disconnect(connection);
+      } catch (disconnectError) {
+        debug('connection cleanup failed: %s', disconnectError.message);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -327,8 +328,11 @@ class ConnectionManager {
    * @returns {Promise}
    */
   async _disconnect(connection) {
-    await this.sequelize.runHooks('beforeDisconnect', connection);
-    await this.dialect.connectionManager.disconnect(connection);
+    try {
+      await this.sequelize.runHooks('beforeDisconnect', connection);
+    } finally {
+      await this.dialect.connectionManager.disconnect(connection);
+    }
     return this.sequelize.runHooks('afterDisconnect', connection);
   }
 

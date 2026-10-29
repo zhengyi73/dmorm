@@ -1298,7 +1298,6 @@ class Model {
     const tableName = this.getTableName(options);
 
     await this.queryInterface.createTable(tableName, attributes, options, this);
-    console.log("------------queryInterface----------")
     if (options.alter) {
       const tableInfos = await Promise.all([
         this.queryInterface.describeTable(tableName, options),
@@ -1752,7 +1751,6 @@ class Model {
       await this.runHooks('beforeFindAfterOptions', options);
     }
     const selectOptions = { ...options, tableNames: Object.keys(tableNames) };
-    console.log("options", selectOptions)
     const results = await this.queryInterface.select(this, this.getTableName(selectOptions), selectOptions);
 
     if (options.hooks) {
@@ -3801,7 +3799,6 @@ class Model {
    * @returns {Promise<Model>}
    */
   async save(options) {
-    console.log("-----------------准备插入数据----------------")
     if (arguments.length > 1) {
       throw new Error('The second argument was removed in favor of the options object.');
     }
@@ -3812,7 +3809,6 @@ class Model {
       validate: true
     });
     
-    console.log("-----------fields", options.fields)
     if (!options.fields) {
       if (this.isNewRecord) {
         options.fields = Object.keys(this.constructor.rawAttributes);

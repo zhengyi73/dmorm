@@ -1323,7 +1323,7 @@ class QueryGenerator {
 
     // Add WHERE to sub or main query
     if (Object.prototype.hasOwnProperty.call(options, 'where') && !options.groupedLimit) {
-      options.where = this.getWhereConditions(options.where, mainTable.as || tableName, model, options);
+      options.where = this.getWhereConditions(options.where, mainTable.as ? new Utils.Literal(mainTable.as) : tableName, model, options);
       if (options.where) {
         if (subQuery) {
           subQueryItems.push(` WHERE ${options.where}`);
@@ -1410,7 +1410,6 @@ class QueryGenerator {
       }
     }
 
-    console.log("====================query==================", query)
     return `${query};`;
   }
 

@@ -142,15 +142,7 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
   }
 
   describeTableQuery(tableName, schema, schemaDelimiter) {
-    const table = this.quoteTable(
-      this.addSchema({
-        tableName,
-        _schema: schema,
-        _schemaDelimiter: schemaDelimiter
-      })
-    );
-
-    return `select * from all_tab_columns where Table_Name='${tableName}';`;
+    return `select * from all_tab_columns where Table_Name=${this.escape(tableName.tableName || tableName)};`;
   }
 
   showTablesQuery(database) {
@@ -234,7 +226,7 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
       // Parse nested object
       if (smth.conditions) {
         const conditions = this.parseConditionObject(smth.conditions).map(condition =>
-          `${this.jsonPathExtractionQuery(condition.path[0], _.tail(condition.path))} = '${condition.value}'`
+          `${this.jsonPathExtractionQuery(condition.path[0], _.tail(condition.path))} = ${this.escape(condition.value)}`
         );
 
         return conditions.join(' AND ');
@@ -252,7 +244,7 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
           str = this.jsonPathExtractionQuery(column, paths);
         }
 
-        if (smth.value) {
+        if (smth.value !== undefined) {
           str += util.format(' = %s', this.escape(smth.value));
         }
 
@@ -309,7 +301,7 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
 
   showIndexesQuery(tableName, options) {
     return Utils.joinSQLFragments([
-      `SELECT INDEX_NAME FROM DBA_INDEXES WHERE TABLE_NAME='${this.quoteTable(tableName)}';`
+      `SELECT INDEX_NAME FROM DBA_INDEXES WHERE TABLE_NAME=${this.escape(tableName.tableName || tableName)};`
     ]);
   }
 
@@ -318,7 +310,7 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
     const schemaName = table.schema;
 
     return Utils.joinSQLFragments([
-      `select * from all_tab_columns where Table_Name='${tableName}'`
+      `select * from all_tab_columns where Table_Name=${this.escape(tableName)}`
       // 'SELECT CONSTRAINT_CATALOG AS constraintCatalog,',
       // 'CONSTRAINT_NAME AS constraintName,',
       // 'CONSTRAINT_SCHEMA AS constraintSchema,',
@@ -505,8 +497,8 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
     return Utils.joinSQLFragments([
       'SELECT',
       FOREIGN_KEY_FIELDS,
-      `FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE where TABLE_NAME = '${tableName}'`,
-      `AND CONSTRAINT_NAME!='PRIMARY' AND CONSTRAINT_SCHEMA='${schemaName}'`,
+      `FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE where TABLE_NAME = ${this.escape(tableName)}`,
+      `AND CONSTRAINT_NAME!='PRIMARY' AND CONSTRAINT_SCHEMA=${this.escape(schemaName)}`,
       'AND REFERENCED_TABLE_NAME IS NOT NULL',
       ';'
     ]);
@@ -521,9 +513,9 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
    * @private
    */
   getForeignKeyQuery(table, columnName) {
-    const quotedSchemaName = table.schema ? wrapSingleQuote(table.schema) : '';
-    const quotedTableName = wrapSingleQuote(table.tableName || table);
-    const quotedColumnName = wrapSingleQuote(columnName);
+    const quotedSchemaName = table.schema ? this.escape(table.schema) : '';
+    const quotedTableName = this.escape(table.tableName || table);
+    const quotedColumnName = this.escape(columnName);
 
     return Utils.joinSQLFragments([
       'SELECT',
@@ -563,11 +555,6 @@ class DmDBQueryGenerator extends AbstractQueryGenerator {
       ';'
     ]);
   }
-}
-
-// private methods
-function wrapSingleQuote(identifier) {
-  return Utils.addTicks(identifier, '\'');
 }
 
 module.exports = DmDBQueryGenerator;
