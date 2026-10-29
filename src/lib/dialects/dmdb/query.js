@@ -3,35 +3,42 @@
 const AbstractQuery = require('../abstract/query');
 const sequelizeErrors = require('../../errors');
 const _ = require('lodash');
+const mapSqlParameters = require('../../utils/sql-parameters');
 const { logger } = require('../../utils/logger');
 
 const ER_DUP_ENTRY = 1062;
-const ER_DEADLOCK = 1213;
 const ER_ROW_IS_REFERENCED = 1451;
 const ER_NO_REFERENCED_ROW = 1452;
 
 const debug = logger.debugContext('sql:dmdb');
+
+// DM extended metadata uses native SQL type IDs, rather than dmdb.NUMBER.
+const isBigIntColumn = column => column && (column.dbType === 8 || /^BIGINT$/i.test(column.dbTypeName || ''));
+const isDecimalColumn = column => column && (column.dbType === 9 || /^(DECIMAL|NUMERIC|NUMBER|DEC)$/i.test(column.dbTypeName || ''));
 
 class Query extends AbstractQuery {
   constructor(connection, sequelize, options) {
     super(connection, sequelize, { showWarnings: false, ...options });
   }
   static formatBindParameters(sql, values, dialect) {
-    const bindParam = [];
-    const replacementFunc = (match, key, values_) => {
-      if (values_[key] !== undefined) {
-        bindParam.push(values_[key]);
-        return '?';
+    const parameters = [];
+    const list = Array.isArray(values);
+    sql = mapSqlParameters(sql, code => code.replace(/\B\$(\$|\w+)/g, (match, key) => {
+      if (key === '$') return '$';
+      const index = list && /^[1-9]\d*$/.test(key) ? Number(key) - 1 : key;
+      if ((list && !/^[1-9]\d*$/.test(key))
+        || (!list && /^\d+$/.test(key))
+        || !Object.prototype.hasOwnProperty.call(values, index)
+        || values[index] === undefined) {
+        throw new Error(`Named bind parameter "${match}" has no value in the given object.`);
       }
-      return undefined;
-    };
-    sql = AbstractQuery.formatBindParameters(sql, values, dialect, replacementFunc)[0];
-   
-    return [sql, bindParam.length > 0 ? bindParam : undefined];
+      parameters.push(values[index]);
+      return `:${parameters.length}`;
+    }));
+    return [sql, parameters.length ? parameters : undefined];
   }
 
   async run(sql, parameters) {
-    sql = sql.replace(/\[|\]/g, '"')
     this.sql = sql;
     
     const { connection, options } = this;
@@ -47,31 +54,26 @@ class Query extends AbstractQuery {
     let results;
 
     try {
-      if ( this.options.bind &&  this.options.bind.length) {
-        results =  await connection.execute(sql, this.options.bind);
-      } else {
-        results = await connection.execute(sql)
-      }
+      // Read column metadata before fetching rows: the driver's default BIGINT
+      // and DECIMAL -> Number conversion loses precision before formatResults.
+      const fetchInfo = Object.create(null);
+      const executeOptions = {
+        autoCommit: !options.transaction,
+        resultSet: true,
+        extendedMetaData: true,
+        fetchInfo
+      };
+      results = await connection.execute(sql, parameters || [], executeOptions);
+      await this.collectResultSets(results, fetchInfo);
     } catch (error) {
-      console.log("\n\n")
-      console.log("--------------error--------------", error)
-      console.log("\n\n")
-      if (options.transaction && error.errno === ER_DEADLOCK) {
-        // MySQL automatically rolls-back transactions in the event of a deadlock.
-        // However, we still initiate a manual rollback to ensure the connection gets released - see #13102.
-        try {
-          await options.transaction.rollback();
-        } catch (error_) {
-          // Ignore errors - since MySQL automatically rolled back, we're
-          // not that worried about this redundant rollback failing.
-        }
-
-        options.transaction.finished = 'rollback';
-      }
-     
+      // dmdb 1.0.52452 can leave a server statement allocated when execute
+      // fails. Retire this connection on release, including transaction cleanup.
+      this.sequelize.connectionManager.invalidate(connection);
       error.sql = sql;
       error.parameters = parameters;
-      throw this.formatError(error);
+      const formattedError = this.formatError(error);
+      formattedError.parameters = parameters;
+      throw formattedError;
     } finally {
       complete();
     }
@@ -80,6 +82,52 @@ class Query extends AbstractQuery {
       await this.logWarnings(results);
     }
     return this.formatResults(results);
+  }
+
+  async collectResultSets(result, fetchInfo) {
+    const cursors = new Set();
+    if (result.resultSet) cursors.add(result.resultSet);
+    for (const implicit of result.implicitResults || []) {
+      if (implicit && typeof implicit.getRows === 'function') cursors.add(implicit);
+    }
+    let failure;
+    try {
+      const read = async (cursor, columns) => {
+        for (const column of columns || []) {
+          if (isBigIntColumn(column) || isDecimalColumn(column)) {
+            fetchInfo[column.name] = { type: this.sequelize.connectionManager.lib.STRING };
+          }
+        }
+        const rows = [];
+        for (;;) {
+          const batch = await cursor.getRows(1000);
+          if (!batch.length) return rows;
+          rows.push(...batch);
+        }
+      };
+      if (result.resultSet) {
+        result.rows = await read(result.resultSet, result.metaData);
+        delete result.resultSet;
+      }
+      if (result.implicitResults) {
+        for (let i = 0; i < result.implicitResults.length; i++) {
+          const cursor = result.implicitResults[i];
+          if (cursors.has(cursor)) result.implicitResults[i] = await read(cursor, cursor.metaData);
+        }
+      }
+    } catch (error) {
+      failure = error;
+    } finally {
+      for (const cursor of cursors) {
+        try {
+          await cursor.close();
+        } catch (error) {
+          this.sequelize.connectionManager.invalidate(this.connection);
+          failure = failure || error;
+        }
+      }
+    }
+    if (failure) throw failure;
   }
 
   /**
@@ -101,55 +149,30 @@ class Query extends AbstractQuery {
    */
   formatResults(data) {
     let result = this.instance;
-    let res = []
-    let {
-      rows = [],
-      metaData = []
-    } = data
-    let i = 0
-    let metaMap = {}
-
-    for (let item of metaData) {
-      let {
-        name
-      } = item;
-      metaMap[i] = name
-      i ++
-    }
-    for (let item of rows) {
-      let itemMap = {}
-      let i = 0
-      for (let sitem of item) {
-       if (typeof sitem === 'bigint') {
-         sitem = Number(sitem)
-       }
-        itemMap[metaMap[i]] = sitem
-        i ++
+    const metadata = data;
+    const affectedRows = metadata.rowsAffected === undefined ? metadata.affectedRows : metadata.rowsAffected;
+    const columns = metadata.metaData || [];
+    const convertValue = (value, column) => {
+      if (typeof value === 'string' && isBigIntColumn(column) && /^-?\d+$/.test(value)) {
+        value = BigInt(value);
       }
-      res.push(itemMap)
-    }
-    data = res
-    if (this.isInsertQuery(data)) {
-      this.handleInsertQuery(data);
+      if (typeof value !== 'bigint') return value;
+      return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(Number.MIN_SAFE_INTEGER)
+        ? Number(value)
+        : value.toString();
+    };
+    data = (metadata.rows || []).map(row => {
+      const entries = Array.isArray(row)
+        ? columns.map((column, index) => [column.name, convertValue(row[index], column)])
+        : Object.entries(row).map(([key, value]) => [key, convertValue(value, columns.find(column => column.name === key))]);
+      return Object.fromEntries(entries);
+    });
 
-      if (!this.instance) {
-        // handle bulkCreate AI primary key
-        if (
-          data.constructor.name === 'ResultSetHeader'
-          && this.model
-          && this.model.autoIncrementAttribute
-          && this.model.autoIncrementAttribute === this.model.primaryKeyAttribute
-          && this.model.rawAttributes[this.model.primaryKeyAttribute]
-        ) {
-          const startId = data[this.getInsertIdField()];
-          result = [];
-          for (let i = startId; i < startId + data.affectedRows; i++) {
-            result.push({ [this.model.rawAttributes[this.model.primaryKeyAttribute].field]: i });
-          }
-        } else {
-          result = data[this.getInsertIdField()];
-        }
+    if (this.isInsertQuery(metadata)) {
+      if (metadata[this.getInsertIdField()] !== undefined) {
+        this.handleInsertQuery(metadata);
       }
+      if (!this.instance) result = metadata[this.getInsertIdField()];
     }
 
     if (this.isSelectQuery()) {
@@ -182,29 +205,26 @@ class Query extends AbstractQuery {
       return data[0];
     }
     if (this.isBulkUpdateQuery() || this.isBulkDeleteQuery()) {
-      return data.affectedRows;
+      return affectedRows;
     }
     if (this.isVersionQuery()) {
-      let {
-        rows
-      } = data
-      return rows;
+      const value = data[0] && Object.values(data[0])[0];
+      return value == null ? undefined : String(value);
     }
     if (this.isForeignKeysQuery()) {
       return data;
     }
     if (this.isUpsertQuery()) {
-      return [result, data.affectedRows === 1];
+      return [result, affectedRows === 1];
     }
     if (this.isInsertQuery() || this.isUpdateQuery()) {
-      return [result, data.affectedRows];
+      return [result, affectedRows];
     }
     if (this.isShowConstraintsQuery()) {
       return data;
     }
     if (this.isRawQuery()) {
-      // MySQL returns row data and metadata (affected rows etc) in a single object - let's standarize it, sorta
-      return [data, data];
+      return [data, metadata];
     }
 
     return result;
@@ -235,9 +255,13 @@ class Query extends AbstractQuery {
   }
 
   formatError(err) {
-    const errCode = err.errno || err.code;
+    const errCode = Number(err.errCode || err.errno || err.code);
 
     switch (errCode) {
+      case -6602:
+        return new sequelizeErrors.UniqueConstraintError({ message: err.message, parent: err, errors: [], fields: {} });
+      case -6607:
+        return new sequelizeErrors.ForeignKeyConstraintError({ parent: err });
       case ER_DUP_ENTRY: {
         const match = err.message.match(/Duplicate entry '([\s\S]*)' for key '?((.|\s)*?)'?$/);
         let fields = {};

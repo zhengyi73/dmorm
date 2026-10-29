@@ -742,23 +742,9 @@ class QueryInterface {
     options = Utils.cloneDeep(options);
     options.hasTrigger = instance && instance.constructor.options.hasTrigger;
     const sql = this.queryGenerator.insertQuery(tableName, values, instance && instance.constructor.rawAttributes, options);
-    let {
-      query,
-      bind
-    } = sql
-    query = query.replace(/\$/g, '\:')
-    let b = []
-    for (let item of bind) {
-      b.push({val: item})
-    }
-    sql.bind = b;
-   
-    
-    sql.query = query
     options.type = QueryTypes.INSERT;
     options.instance = instance;
   
-    console.log("--------------------sql1---------------", sql.sql, sql.bind)
     const results = await this.sequelize.query(sql, options);
     if (instance) results[0].isNewRecord = false;
    

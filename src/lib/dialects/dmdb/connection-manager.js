@@ -4,18 +4,12 @@ const AbstractConnectionManager = require('../abstract/connection-manager');
 const SequelizeErrors = require('../../errors');
 const { logger } = require('../../utils/logger');
 const DataTypes = require('../../data-types').dmdb;
-const momentTz = require('moment-timezone');
 const debug = logger.debugContext('connection:dmdb');
 const parserStore = require('../parserStore')('dmdb');
-const { promisify } = require('util');
 
 /**
- * MySQL Connection Manager
- *
- * Get connections, validate and disconnect them.
- * AbstractConnectionManager pooling use it to handle MySQL specific connections
- * Use https://github.com/sidorares/node-mysql2 to connect with MySQL server
- *
+ * DM connections are owned by the ORM pool. Never create a driver pool here:
+ * closing a borrowed driver connection would only return it to that hidden pool.
  * @private
  */
 class ConnectionManager extends AbstractConnectionManager {
@@ -23,6 +17,8 @@ class ConnectionManager extends AbstractConnectionManager {
     sequelize.config.port = sequelize.config.port || 5236;
     super(dialect, sequelize);
     this.lib = this._loadDialectModule('dmdb');
+    this._invalidConnections = new WeakSet();
+    this._closedConnections = new WeakSet();
     this.refreshTypeParser(DataTypes);
   }
 
@@ -41,105 +37,24 @@ class ConnectionManager extends AbstractConnectionManager {
     return next();
   }
 
-  /**
-   * Connect with MySQL database based on config, Handle any errors in connection
-   * Set the pool handlers on connection.error
-   * Also set proper timezone once connection is connected.
-   *
-   * @param {object} config
-   * @returns {Promise<Connection>}
-   * @private
-   */
   async connect(config) {
+    const dialectOptions = config.dialectOptions || {};
     const connectionConfig = {
-      host: config.host,
-      port: config.port,
       user: config.username,
-      flags: '-FOUND_ROWS',
       password: config.password,
-      database: config.database,
-      timezone: this.sequelize.options.timezone,
-      typeCast: ConnectionManager._typecast.bind(this),
-      bigNumberStrings: false,
-      supportBigNumbers: true,
-      ...config.dialectOptions
+      ...dialectOptions,
+      connectString: dialectOptions.connectString || dialectOptions.connectionString || `${config.host}:${config.port}`
     };
 
-    
     try {
-  
-      let {
-        host,
-        port,
-        user,
-        password,
-        database
-      } = connectionConfig
-      
-      console.log("------------连接--------------", `dm://${user}:${password}@${host}:${port}?useUnicode=true&characterEncoding=utf-8`)
-      const pool = await this.lib.createPool({
-        connectString: `dm://${user}:${password}@${host}:${port}?useUnicode=true&characterEncoding=utf-8`,
-        poolMin: 10,
-        poolMax: 30
-      })
-      
-      const connection = await pool.getConnection()
-      
-      const errorHandler = e => {
-        console.log("-------errorHandler---------", e)
-        // clean up connect & error event if there is error
-        connection.removeListener('connect', connectHandler);
-        connection.removeListener('error', connectHandler);
-      };
-  
-        connection.on('error', errorHandler);
-      // console.log("----------pool---------", pool)
-      //
-      // const connection = await new Promise((resolve, reject) => {
-      //
-      //
-      //
-      //   console.log("----------connect---------", connect)
-      //   const errorHandler = e => {
-      //     // clean up connect & error event if there is error
-      //     connection.removeListener('connect', connectHandler);
-      //     connection.removeListener('error', connectHandler);
-      //     reject(e);
-      //   };
-      //
-      //   const connectHandler = () => {
-      //     // clean up error event if connected
-      //     connection.removeListener('error', errorHandler);
-      //     resolve(connection);
-      //   };
-      //
-      //   // don't use connection.once for error event handling here
-      //   // mysql2 emit error two times in case handshake was failed
-      //   // first error is protocol_lost and second is timeout
-      //   // if we will use `once.error` node process will crash on 2nd error emit
-      //   connection.on('error', errorHandler);
-      //   connection.once('connect', connectHandler);
-      // });
-      //
-      // debug('connection acquired');
-      // connection.on('error', error => {
-      //   switch (error.code) {
-      //     case 'ESOCKET':
-      //     case 'ECONNRESET':
-      //     case 'EPIPE':
-      //     case 'PROTOCOL_CONNECTION_LOST':
-      //       this.pool.destroy(connection);
-      //   }
-      // });
-      //
-      // if (!this.sequelize.config.keepDefaultTimezone) {
-      //   // set timezone for this connection
-      //   // but named timezone are not directly supported in mysql, so get its offset first
-      //   let tzOffset = this.sequelize.options.timezone;
-      //   tzOffset = /\//.test(tzOffset) ? momentTz.tz(tzOffset).format('Z') : tzOffset;
-      //   await promisify(cb => connection.query(`SET time_zone = '${tzOffset}'`, cb))();
-      // }
-
+      const connection = await this.lib.getConnection(connectionConfig);
+      if (typeof connection.on === 'function') {
+        connection.on('error', error => {
+          this._invalidConnections.add(connection);
+          debug('connection error: %s', error.errCode || error.code || error.message);
+        });
+      }
+      debug('connection acquired');
       return connection;
     } catch (err) {
       switch (err.code) {
@@ -160,17 +75,31 @@ class ConnectionManager extends AbstractConnectionManager {
   }
 
   async disconnect(connection) {
-    // Don't disconnect connections with CLOSED state
-    if (connection._closing) {
-      debug('connection tried to disconnect but was already at CLOSED state');
+    if (connection.closed === true || this._closedConnections.has(connection)) {
       return;
     }
+    this._invalidConnections.add(connection);
+    await connection.close();
+    this._closedConnections.add(connection);
+  }
 
-    return await promisify(callback => connection.close(callback))();
+  async releaseConnection(connection) {
+    if (!this.validate(connection)) {
+      await this.destroyConnection(connection);
+      return;
+    }
+    await super.releaseConnection(connection);
+  }
+
+  invalidate(connection) {
+    this._invalidConnections.add(connection);
   }
 
   validate(connection) {
-    return connection
+    return !!connection
+      && connection.closed !== true
+      && !this._invalidConnections.has(connection)
+      && !this._closedConnections.has(connection);
   }
 }
 

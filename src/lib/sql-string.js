@@ -1,6 +1,7 @@
 'use strict';
 
 const dataTypes = require('./data-types');
+const mapSqlParameters = require('./utils/sql-parameters');
 const { logger } = require('./utils/logger');
 
 function arrayToList(array, timeZone, dialect, format) {
@@ -99,26 +100,28 @@ function format(sql, values, timeZone, dialect) {
     throw new Error(`Invalid SQL string provided: ${sql}`);
   }
 
-  return sql.replace(/\?/g, match => {
+  const replace = code => code.replace(/\?/g, match => {
     if (!values.length) {
+      if (dialect === 'dmdb') throw new Error('Not enough positional replacement values.');
       return match;
     }
-
     return escape(values.shift(), timeZone, dialect, true);
   });
+  return dialect === 'dmdb' ? mapSqlParameters(sql, replace) : replace(sql);
 }
 exports.format = format;
 
 function formatNamedParameters(sql, values, timeZone, dialect) {
-  return sql.replace(/:+(?!\d)(\w+)/g, (value, key) => {
+  const replace = code => code.replace(/:+(?!\d)(\w+)/g, (value, key) => {
     if ('postgres' === dialect && '::' === value.slice(0, 2)) {
       return value;
     }
 
-    if (values[key] !== undefined) {
+    if (Object.prototype.hasOwnProperty.call(values, key) && values[key] !== undefined) {
       return escape(values[key], timeZone, dialect, true);
     }
     throw new Error(`Named parameter "${value}" has no value in the given object.`);
   });
+  return dialect === 'dmdb' ? mapSqlParameters(sql, replace) : replace(sql);
 }
 exports.formatNamedParameters = formatNamedParameters;

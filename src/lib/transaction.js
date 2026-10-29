@@ -56,15 +56,19 @@ class Transaction {
       throw new Error(`Transaction cannot be committed because it has been finished with state: ${this.finished}`);
     }
 
+    let result;
+    let failed = true;
     try {
-      return await this.sequelize.getQueryInterface().commitTransaction(this, this.options);
+      result = await this.sequelize.getQueryInterface().commitTransaction(this, this.options);
+      failed = false;
     } finally {
       this.finished = 'commit';
-      this.cleanup();
-      for (const hook of this._afterCommitHooks) {
-        await hook.apply(this, [this]);
-      }
+      await this.cleanup(failed);
     }
+    for (const hook of this._afterCommitHooks) {
+      await hook.apply(this, [this]);
+    }
+    return result;
   }
 
   /**
@@ -81,13 +85,14 @@ class Transaction {
       throw new Error('Transaction cannot be rolled back because it never started');
     }
 
+    let failed = true;
     try {
-      return await this
-        .sequelize
-        .getQueryInterface()
-        .rollbackTransaction(this, this.options);
+      const result = await this.sequelize.getQueryInterface().rollbackTransaction(this, this.options);
+      failed = false;
+      return result;
     } finally {
-      this.cleanup();
+      this.finished = 'rollback';
+      await this.cleanup(failed);
     }
   }
 
@@ -160,15 +165,23 @@ class Transaction {
     return queryInterface.startTransaction(this, this.options);
   }
 
-  cleanup() {
-    // Don't release the connection if there's a parent transaction or
-    // if we've already cleaned up
-    if (this.parent || this.connection.uuid === undefined) return;
-
+  async cleanup(force = false) {
     this._clearCls();
-    const res = this.sequelize.connectionManager.releaseConnection(this.connection);
+    if (this.parent) {
+      // A failed savepoint operation leaves the shared transaction uncertain.
+      if (force) {
+        this.parent.finished = 'rollback';
+        await this.parent.cleanup(true);
+      }
+      return;
+    }
+    if (!this.connection || this.connection.uuid === undefined) return;
     this.connection.uuid = undefined;
-    return res;
+    if (force) {
+      await this.sequelize.connectionManager.destroyConnection(this.connection);
+    } else {
+      await this.sequelize.connectionManager.releaseConnection(this.connection);
+    }
   }
 
   _clearCls() {
@@ -176,7 +189,7 @@ class Transaction {
 
     if (cls) {
       if (cls.get('transaction') === this) {
-        cls.set('transaction', null);
+        cls.set('transaction', this.parent || null);
       }
     }
   }

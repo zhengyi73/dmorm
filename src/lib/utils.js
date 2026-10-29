@@ -95,7 +95,6 @@ function spliceStr(str, index, count, add) {
 exports.spliceStr = spliceStr;
 
 function camelize(str) {
-  console.log("--------------", str)
   return str.trim().replace(/[-_\s]+(.)?/g, (match, c) => c.toUpperCase());
 }
 exports.camelize = camelize;
@@ -458,7 +457,7 @@ class Json extends SequelizeMethod {
       this.conditions = conditionsOrPath;
     } else {
       this.path = conditionsOrPath;
-      if (value) {
+      if (value !== undefined) {
         this.value = value;
       }
     }

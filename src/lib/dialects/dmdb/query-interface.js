@@ -3,11 +3,24 @@
 const sequelizeErrors = require('../../errors');
 const { QueryInterface } = require('../abstract/query-interface');
 const QueryTypes = require('../../query-types');
+const Transaction = require('../../transaction');
 
 /**
  * The interface that Sequelize uses to talk with MySQL/MariaDB database
  */
 class DmDBQueryInterface extends QueryInterface {
+  async startTransaction(transaction, options) {
+    if (!(transaction instanceof Transaction)) {
+      throw new Error('Unable to start a transaction without transaction object!');
+    }
+    if (transaction.parent) return super.startTransaction(transaction, options);
+    // DM starts a transaction with its first statement. Query.run disables
+    // auto-commit per statement, including isolation-level and savepoint SQL.
+    if (transaction.options.readOnly) {
+      return this.sequelize.query('SET TRANSACTION READ ONLY;', { ...options, transaction });
+    }
+  }
+
   /**
    * A wrapper that fixes MySQL's inability to cleanly remove columns from existing tables if they have a foreign key constraint.
    *

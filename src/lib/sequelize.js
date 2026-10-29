@@ -313,7 +313,6 @@ class Sequelize {
       keepDefaultTimezone: this.options.keepDefaultTimezone,
       dialectOptions: this.options.dialectOptions
     };
-    console.log("-----------------", this.config.database,this.config.username)
     let Dialect;
     // Requiring the dialect in a switch-case to keep the
     // require calls static. (Browserify fix)
@@ -328,15 +327,16 @@ class Sequelize {
         Dialect = require('./dialects/mssql');
         break;
       case 'mysql':
-        // Dialect = require('./dialects/mysql');
+        Dialect = require('./dialects/mysql');
         break;
       case 'postgres':
         Dialect = require('./dialects/postgres');
         break;
       case 'sqlite':
+        Dialect = require('./dialects/sqlite');
         break;
       default:
-        throw new Error(`The dialect ${this.getDialect()} is not supported. Supported dialects: mssql, mariadb, mysql, postgres, and sqlite.`);
+        throw new Error(`The dialect ${this.getDialect()} is not supported. Supported dialects: dmdb, mssql, mariadb, mysql, postgres, and sqlite.`);
     }
 
     this.dialect = new Dialect(this);
@@ -376,7 +376,7 @@ class Sequelize {
    * @returns {string} The specified dialect.
    */
   getDialect() {
-    return 'dmdb';
+    return this.options.dialect;
   }
 
   /**
@@ -612,18 +612,20 @@ class Sequelize {
 
       checkTransaction();
       const connection = await (options.transaction ? options.transaction.connection : this.connectionManager.getConnection(options));
-      const query = new this.dialect.Query(connection, this, options);
-
+      let query;
       try {
+        query = new this.dialect.Query(connection, this, options);
       
         await this.runHooks('beforeQuery', options, query);
         checkTransaction();
-        console.log("--------------查询节点")
         return await query.run(sql, bindParameters);
       } finally {
-        await this.runHooks('afterQuery', options, query);
-        if (!options.transaction) {
-          await this.connectionManager.releaseConnection(connection);
+        try {
+          if (query) await this.runHooks('afterQuery', options, query);
+        } finally {
+          if (!options.transaction) {
+            await this.connectionManager.releaseConnection(connection);
+          }
         }
       }
     }, retryOptions);
@@ -1263,7 +1265,7 @@ Sequelize.prototype.validate = Sequelize.prototype.authenticate;
 /**
  * Sequelize version number.
  */
-Sequelize.version = require('../package.json').version;
+Sequelize.version = require('../../package.json').version;
 
 Sequelize.options = { hooks: {} };
 

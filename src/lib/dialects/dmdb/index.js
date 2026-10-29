@@ -55,7 +55,7 @@ DmdbDialect.prototype.Query = Query;
 DmdbDialect.prototype.QueryGenerator = QueryGenerator;
 DmdbDialect.prototype.DataTypes = DataTypes;
 DmdbDialect.prototype.name = 'dmdb';
-DmdbDialect.prototype.TICK_CHAR = '';
+DmdbDialect.prototype.TICK_CHAR = '"';
 DmdbDialect.prototype.TICK_CHAR_LEFT = DmdbDialect.prototype.TICK_CHAR;
 DmdbDialect.prototype.TICK_CHAR_RIGHT = DmdbDialect.prototype.TICK_CHAR;
 
